@@ -12,9 +12,10 @@ statistics — a particular year's sequence of daily values — governed by a
 seed and a latitude. The output is `FWeatherSample`, an `FRuntimeFloatCurve`
 per channel over the requested span, ready for downstream consumers.
 
-The plugin imports no other agriculture plugin. Soil and Vegetation receive
-an `FWeatherSample` and field-copy from it via `UWeatherBlueprintLibrary`;
-neither knows anything about the generation process.
+The plugin imports no other agriculture plugin. Downstream consumers receive
+`FWeatherSample` as a self-contained output; translation into Soil and
+Vegetation input structs is handled by `UPhenologyWeatherLibrary` in the
+Phenology plugin.
 
 ## Stochastic models
 
@@ -36,8 +37,8 @@ for humidity (dry or humid air masses persist for several days).
 
 Relative humidity is emitted as a fraction in `[0, 1]` and clamped to that
 range after each AR(1) draw — draws that stray outside due to large σ are
-clipped rather than wrapped. The downstream consumer (Botany boundary) converts
-it to vapour pressure deficit: `VPD_kPa = SVP(T) × (1 − RH)`.
+clipped rather than wrapped. The downstream consumer converts it to vapour
+pressure deficit: `VPD_kPa = SVP(T) × (1 − RH)`.
 
 AR(1) was chosen over i.i.d. because independent days produce unrealistically
 rapid swings — a −15°C day followed by a +10°C day the next. The model's
@@ -110,16 +111,15 @@ outside that range produce non-stationary sequences but will not crash.
 
 ## Plugin boundary
 
-`UWeatherBlueprintLibrary` is the only file in the Weather plugin that imports
-Soil or Vegetation types. It is a translation layer: field-copy from
-`FWeatherSample` channels into `FSoilWeather`, `FSoilWeatherInput`,
-`FVegetationAmbient`, and `FVegetationTickAmbient`. The Weather plugin itself
-— `UWeatherTemplate`, `UWeatherInstance`, `FWeatherSample` — has no knowledge
-of what consumes its output.
+Weather has no dependency on Soil, Vegetation, Botany, or Phenology.
+`UWeatherTemplate`, `UWeatherInstance`, and `FWeatherSample` compile and ship
+without any other agriculture plugin.
 
-This separation means the Weather plugin ships and compiles without Soil or
-Vegetation. Projects that use Weather for non-agriculture purposes can depend
-on only the `Weather` module and omit `UWeatherBlueprintLibrary`.
+Translation from `FWeatherSample` into consumer structs (`FSoilWeather`,
+`FSoilWeatherInput`, `FVegetationAmbient`, `FVegetationTickAmbient`) is handled
+by `UPhenologyWeatherLibrary` in the Phenology plugin — the layer that pairs
+Weather output with the Botany demand/supply pipeline. Projects that use Weather
+standalone can work directly with `FWeatherSample` without depending on Phenology.
 
 ## Known limitations / deferred work
 
@@ -144,11 +144,10 @@ post-processing on the generated values.
 
 ## Test surface
 
-Twenty-one automation tests across three files in
-`Plugins/Weather/Source/Weather/Private/Tests/`.
+Fourteen automation tests across two files in
+`Source/Weather/Private/Tests/`.
 
 | Suite | File | Covers |
 |---|---|---|
 | `Weather.WeatherTemplate.*` | `WeatherTemplateTests.cpp` | Template construction, field validation, RH curves |
 | `Weather.WeatherInstance.*` | `WeatherInstanceTests.cpp` | AR(1) continuity, burn-in seam, determinism, cursor semantics, RH range + continuity |
-| `Weather.WeatherBlueprintLibrary.*` | `WeatherBlueprintLibraryTests.cpp` | Field-copy correctness, unfilled channel contracts, VPD formula + boundary conditions |
