@@ -4,21 +4,23 @@
 
 The Weather plugin generates physically-motivated daily weather data from
 authored climate statistics. Given a **UWeatherTemplate** (mean, variance, and
-autocorrelation for temperature, rainfall, and wind) and a geographic latitude,
-a **UWeatherInstance** acts as a cursor that advances through game time,
-producing an **FWeatherSample** — a set of five curves for each span advanced.
+autocorrelation for temperature, rainfall, wind, and relative humidity) and a
+geographic latitude, a **UWeatherInstance** acts as a cursor that advances
+through game time, producing an **FWeatherSample** — a set of six curves for
+each span advanced.
 
 | Channel | Unit | Generation method |
 |---|---|---|
 | Air temperature | °C | AR(1) autoregressive |
 | Rainfall | mm/day | i.i.d. Bernoulli × Normal |
 | Wind speed | m/s | AR(1) autoregressive |
+| Relative humidity | fraction [0, 1] | AR(1) autoregressive |
 | Day length | hours | Closed-form (latitude + day-of-year) |
-| Solar insolation | normalized [0, 1] | Closed-form, attenuated by rain probability |
+| Solar insolation | MJ/m²/day | Closed-form, attenuated by rain probability |
 
-The output is translated into the data structures expected by the **Soil** and
-**Vegetation** plugins via **UWeatherBlueprintLibrary**, making Weather the
-environmental input layer for the Botany demand/supply pipeline.
+The Weather plugin has no dependency on Soil, Vegetation, Botany, or Phenology.
+Translation from `FWeatherSample` into the structs expected by downstream
+plugins is handled by `UPhenologyWeatherLibrary` in the **Phenology** plugin.
 
 The plugin ships with two simulation paths:
 
@@ -45,8 +47,8 @@ will produce different sequences.
 
 ### AR(1) Autocorrelation
 
-Temperature and wind use a first-order autoregressive (AR(1)) process to
-produce realistic day-to-day persistence:
+Temperature, wind, and relative humidity all use a first-order autoregressive
+(AR(1)) process to produce realistic day-to-day persistence:
 
 ```
 Today = α · Yesterday + (1 − α) · Mean(day) + Normal(0, σ(day))
@@ -57,6 +59,8 @@ Today = α · Yesterday + (1 − α) · Mean(day) + Normal(0, σ(day))
 - **α = 0** — fully i.i.d.; no memory between days.
 
 `TemperatureAR1Alpha` defaults to 0.6. `WindAR1Alpha` defaults to 0.4.
+`RelativeHumidityAR1Alpha` defaults to 0.6. Relative humidity is emitted as a
+fraction in `[0, 1]` and clamped after each AR(1) draw.
 
 ### Rainfall
 
@@ -75,7 +79,7 @@ Both are deterministic and require no authoring beyond the latitude supplied to
 - **Solar insolation** is derived from day length, attenuated by a cloud-cover
   proxy built from `RainfallProbability`.
 
-Neither field appears in UWeatherTemplate.
+Neither field appears in `UWeatherTemplate`.
 
 ### Determinism
 
@@ -88,9 +92,9 @@ as a pure function of `(Template, Seed, LatitudeDeg, LastProcessedTime, T_end)`.
 ### AR(1) Carry State and Span Continuity
 
 `UWeatherInstance` keeps a lightweight carry buffer: after each `AdvanceTo`
-call it stores the final temperature and wind AR(1) state. Sequential calls
-forward that carry directly — temperature and wind are bit-exactly continuous
-at every span boundary:
+call it stores the final temperature, wind, and relative humidity AR(1) state.
+Sequential calls forward that carry directly — all three AR(1) channels are
+bit-exactly continuous at every span boundary:
 
 ```
 AdvanceTo(7)   →  carry stored at T=7;  LastProcessedTime = 7
@@ -132,6 +136,9 @@ A `UDataAsset` subclass. All fields are `FRuntimeFloatCurve` curves keyed on
 | `MeanWindSpeed_ms` | Daily mean wind speed (≥ 0) |
 | `WindStdDev_ms` | Daily wind standard deviation (≥ 0) |
 | `WindAR1Alpha` | AR(1) smoothing coefficient for wind, [0, 1] |
+| `MeanRelativeHumidity` | Daily mean relative humidity, fraction [0, 1] |
+| `RelativeHumidityStdDev` | Daily RH standard deviation (≥ 0) |
+| `RelativeHumidityAR1Alpha` | AR(1) smoothing coefficient for RH, [0, 1] |
 
 ### UWeatherInstance
 
@@ -151,45 +158,29 @@ A `UObject` subclass. Acts as a cursor over the climate template.
 | `AirTemperature_C` | `FRuntimeFloatCurve` | Daily air temperature in °C |
 | `Rainfall_mm_per_day` | `FRuntimeFloatCurve` | Daily rainfall in mm |
 | `WindSpeed_ms` | `FRuntimeFloatCurve` | Daily wind speed in m/s |
+| `RelativeHumidity` | `FRuntimeFloatCurve` | Relative humidity, fraction [0, 1] |
 | `DayLength_hours` | `FRuntimeFloatCurve` | Daylight hours |
-| `SolarInsolation` | `FRuntimeFloatCurve` | Normalised solar energy [0, 1] |
+| `SolarInsolation` | `FRuntimeFloatCurve` | Solar energy in MJ/m²/day |
 | `SpanStart` | `double` | First day of the sampled span |
 | `SpanEnd` | `double` | One past the last day of the sampled span |
 
 All curves are keyed at day midpoints (DayIndex + 0.5 on the X-axis).
 
-### UWeatherBlueprintLibrary
-
-Static helper functions for translating `FWeatherSample` into the structs
-expected by the Soil and Vegetation plugins.
-
-**Curve path (AdvanceTo workflow):**
-
-| Function | Output | Notes |
-|---|---|---|
-| `WeatherSampleToSoilWeather(Sample)` | `FSoilWeather` | Copies AirTemperature_C, Rainfall_mm_per_day, WindSpeed_ms, SolarInsolation curves |
-| `WeatherSampleToVegetationAmbient(Sample)` | `FVegetationAmbient` | Copies AirTemperature_C, DayLength_hours, WindSpeed_ms curves; **SoilTemperature, SoilMoisture, PAR left empty** |
-
-**Tick path (TickField workflow):**
-
-| Function | Output | Notes |
-|---|---|---|
-| `WeatherSampleToSoilWeatherInput(Sample, T, TickDays)` | `FSoilWeatherInput` | Point-in-time sample at T; RainfallMM is scaled by TickDays |
-| `WeatherSampleToVegetationTickAmbient(Sample, T)` | `FVegetationTickAmbient` | Point-in-time scalars at T; SoilTemperature, SoilMoisture, PAR left at zero |
-
 ---
 
 ## Prerequisites
 
-- **Soil plugin** — required by UWeatherBlueprintLibrary for `FSoilWeather` /
-  `FSoilWeatherInput` types.
-- **Vegetation plugin** — required by UWeatherBlueprintLibrary for
-  `FVegetationAmbient` / `FVegetationTickAmbient` types.
-- **Botany plugin** — required to drive `UBotanyField::AdvanceTo` or `TickField`
-  with the translated weather structs.
-
-The Weather plugin itself has no runtime dependencies on the above plugins; only
-`UWeatherBlueprintLibrary` (which lives in the Weather module) pulls them in.
+- The Weather plugin has **no runtime dependency** on Soil, Vegetation, Botany,
+  or Phenology. Steps 1–3 (template authoring, instance creation, and advancing
+  weather) work without any other agriculture plugin.
+- **Phenology plugin** — required for Steps 4–5 (`UPhenologyWeatherLibrary`),
+  which translate `FWeatherSample` into the structs expected by Soil and
+  Vegetation. Add `"Phenology"` to your module's `PublicDependencyModuleNames`
+  in `Build.cs` and to your `.uplugin` if needed. If you are using
+  `UPhenologyField`, translation is handled automatically and you do not need
+  Steps 4–5.
+- **Botany plugin** — required for Step 6 (`UBotanyField::AdvanceTo` /
+  `TickField`).
 
 ---
 
@@ -197,18 +188,19 @@ The Weather plugin itself has no runtime dependencies on the above plugins; only
 
 1. In the Content Browser, right-click → **Miscellaneous → Data Asset**.
 2. Select `UWeatherTemplate` as the class.
-3. Open the asset. For each of the nine curve fields, add keys across the
+3. Open the asset. For each of the twelve curve fields, add keys across the
    day-of-year range [0, 365] to describe the annual climate cycle.
 
 **Authoring rules:**
 
 - All standard deviation fields (`TemperatureStdDev_C`, `RainfallStdDev_mm`,
-  `WindStdDev_ms`) must be ≥ 0 everywhere. Negative values will be treated as
-  zero internally but will not produce an error.
-- AR(1) alpha fields (`TemperatureAR1Alpha`, `WindAR1Alpha`) should stay in
-  [0, 1]. Values outside this range are not clamped and will produce
-  non-stationary sequences.
-- `RainfallProbability` must be in [0, 1] for the Bernoulli draw to be valid.
+  `WindStdDev_ms`, `RelativeHumidityStdDev`) must be ≥ 0 everywhere. Negative
+  values will be treated as zero internally but will not produce an error.
+- AR(1) alpha fields (`TemperatureAR1Alpha`, `WindAR1Alpha`,
+  `RelativeHumidityAR1Alpha`) should stay in [0, 1]. Values outside this range
+  are not clamped and will produce non-stationary sequences.
+- `RainfallProbability` and `MeanRelativeHumidity` must be in [0, 1] for the
+  draws to be valid.
 - A flat curve (single key at X = 0) is valid and produces a seasonally
   constant climate.
 
@@ -253,9 +245,10 @@ Weather->SetLastProcessedTime(StartDay);
 const FWeatherSample Sample = Weather->AdvanceTo(StartDay + SpanDays);
 ```
 
-Sequential `AdvanceTo` calls carry the AR(1) state forward — temperature and
-wind are bit-exactly continuous at every span boundary. After `SetLastProcessedTime`,
-the next call uses a 30-day burn-in and will be approximately continuous.
+Sequential `AdvanceTo` calls carry the AR(1) state forward — temperature, wind,
+and relative humidity are bit-exactly continuous at every span boundary. After
+`SetLastProcessedTime`, the next call uses a 30-day burn-in and will be
+approximately continuous.
 
 The returned `FWeatherSample` is a value type — copy it freely. All curves
 inside it are self-contained `FRuntimeFloatCurve` objects.
@@ -264,9 +257,12 @@ inside it are self-contained `FRuntimeFloatCurve` objects.
 
 ## Step 4 — Build FSoilWeather (Curve Path)
 
+> **Requires the Phenology plugin.** Add `"Phenology"` to your module's
+> `PublicDependencyModuleNames` in `Build.cs` and to your `.uplugin` if needed.
+
 ```cpp
 const FSoilWeather SoilWeather =
-    UWeatherBlueprintLibrary::WeatherSampleToSoilWeather(Sample);
+    UPhenologyWeatherLibrary::WeatherSampleToSoilWeather(Sample);
 ```
 
 This copies four channels from the sample directly into an `FSoilWeather`
@@ -279,8 +275,8 @@ struct. The channel mapping is:
 | `WindSpeed_ms` | `WindSpeed_ms` |
 | `SolarInsolation` | `SolarInsolation` |
 
-`DayLength_hours` is not included in `FSoilWeather`; it goes to
-`FVegetationAmbient` in the next step.
+`DayLength_hours` and `RelativeHumidity` are not included in `FSoilWeather`;
+they go to `FVegetationAmbient` in the next step.
 
 ---
 
@@ -288,34 +284,31 @@ struct. The channel mapping is:
 
 ```cpp
 FVegetationAmbient VegAmbient =
-    UWeatherBlueprintLibrary::WeatherSampleToVegetationAmbient(Sample);
+    UPhenologyWeatherLibrary::WeatherSampleToVegetationAmbient(Sample);
 ```
 
-This copies three atmospheric channels. The channel mapping is:
+This fills five channels. The channel mapping is:
 
-| FWeatherSample channel | FVegetationAmbient field |
-|---|---|
-| `AirTemperature_C` | `AirTemperature` |
-| `DayLength_hours` | `DayLength` |
-| `WindSpeed_ms` | `Wind` |
+| FWeatherSample channels | FVegetationAmbient field | Notes |
+|---|---|---|
+| `AirTemperature_C` | `AirTemperature` | Copied directly |
+| `DayLength_hours` | `DayLength` | Copied directly |
+| `WindSpeed_ms` | `Wind` | Copied directly |
+| `AirTemperature_C` + `RelativeHumidity` | `VPD_kPa` | `SVP(T) × (1 − RH)` per key, kPa (Tetens, FAO-56) |
+| `SolarInsolation` | `PAR` | `SolarInsolation × 0.45 × 4.57×10⁶ / (DayLength_hours × 3600)`, µmol/m²/s |
 
 > **Required: fill the soil-derived channels before passing to AdvanceTo.**
 >
-> `WeatherSampleToVegetationAmbient` deliberately leaves three fields
+> `WeatherSampleToVegetationAmbient` deliberately leaves two fields
 > **empty** (no curve keys):
 >
 > - `SoilTemperature`
 > - `SoilMoisture`
-> - `PAR` (photosynthetically active radiation)
 >
-> These values come from Soil state, not from Weather. The Vegetation plugin
-> does not silently treat empty curves as zero — curves with no keys evaluate
-> to the engine default (usually 0.0), which will drive plants to zero stress
-> response. Fill these fields from your `USoilInstance` before calling
-> `AdvanceTo`.
->
-> Even a flat constant curve (a single key at X = Sample.SpanStart with the
-> current soil value) is valid. An empty curve is not.
+> These values come from Soil state, not from Weather. Fill them from your
+> `USoilInstance` before calling `AdvanceTo`. Even a flat constant curve (a
+> single key at X = Sample.SpanStart with the current soil value) is valid.
+> An empty curve is not.
 
 Example — read from soil and install flat curves:
 
@@ -325,14 +318,14 @@ const FSoilSample Soil = SoilInstance->GetSample();
 FRichCurve* SoilTemp = VegAmbient.SoilTemperature.GetRichCurve();
 SoilTemp->AddKey(Sample.SpanStart, Soil.Temperature_C);
 
-FRichCurve* SoilMoisture = VegAmbient.SoilMoisture.GetRichCurve();
-SoilMoisture->AddKey(Sample.SpanStart, Soil.VolumetricWaterContent);
-
-FRichCurve* PAR = VegAmbient.PAR.GetRichCurve();
-PAR->AddKey(Sample.SpanStart, Soil.PAR);  // or compute from insolation
+FRichCurve* SoilMoistCurve = VegAmbient.SoilMoisture.GetRichCurve();
+SoilMoistCurve->AddKey(Sample.SpanStart, Soil.VolumetricWaterContent);
 ```
 
-If you are using `UBotanyField::AdvanceTo`, the field handles soil state
+If you are using `UPhenologyField::AdvanceTo`, soil snapshots and translation
+are handled automatically — you do not need Steps 4–5.
+
+If you are using `UBotanyField::AdvanceTo` directly, it handles soil state
 internally and constructs the correct ambient from its own soil reference —
 you do not need to fill these fields manually.
 
@@ -364,19 +357,19 @@ soil state via `USoilInstance::GetSample()`.
 | `GetLastProcessedTime()` | `double` | Current cursor position |
 | `SetLastProcessedTime(T)` | `void` | Reposition without computing; clears carry |
 
-### UWeatherBlueprintLibrary — Curve Path
+### UPhenologyWeatherLibrary — Curve Path
 
-| Call | Returns | Soil-derived fields? |
+| Call | Returns | Notes |
 |---|---|---|
-| `WeatherSampleToSoilWeather(Sample)` | `FSoilWeather` | N/A |
-| `WeatherSampleToVegetationAmbient(Sample)` | `FVegetationAmbient` | **Empty — caller must fill** |
+| `WeatherSampleToSoilWeather(Sample)` | `FSoilWeather` | Copies 4 atmospheric curves |
+| `WeatherSampleToVegetationAmbient(Sample)` | `FVegetationAmbient` | Fills AirTemperature, DayLength, Wind, VPD_kPa, PAR; **SoilTemperature and SoilMoisture empty — caller must fill** |
 
-### UWeatherBlueprintLibrary — Tick Path
+### UPhenologyWeatherLibrary — Tick Path
 
 | Call | Returns | Notes |
 |---|---|---|
 | `WeatherSampleToSoilWeatherInput(Sample, T, TickDays)` | `FSoilWeatherInput` | RainfallMM scaled by TickDays |
-| `WeatherSampleToVegetationTickAmbient(Sample, T)` | `FVegetationTickAmbient` | SoilTemperature/SoilMoisture/PAR = 0 |
+| `WeatherSampleToVegetationTickAmbient(Sample, T)` | `FVegetationTickAmbient` | Fills AirTemperature, DayLength, Wind, VPD_kPa, PAR; SoilTemperature and SoilMoisture left at 0 |
 
 ### Template Field Constraints
 
@@ -390,6 +383,9 @@ soil state via `USoilInstance::GetSample()`.
 | `MeanWindSpeed_ms` | ≥ 0 |
 | `WindStdDev_ms` | ≥ 0 |
 | `WindAR1Alpha` | [0, 1] recommended |
+| `MeanRelativeHumidity` | [0, 1] |
+| `RelativeHumidityStdDev` | ≥ 0 |
+| `RelativeHumidityAR1Alpha` | [0, 1] recommended |
 
 ---
 
@@ -413,26 +409,26 @@ const float TickDays = DeltaSeconds / SecondsPerDay;
 const double NowTime = CurrentGameTimeDays;
 
 const FSoilWeatherInput SoilInput =
-    UWeatherBlueprintLibrary::WeatherSampleToSoilWeatherInput(
+    UPhenologyWeatherLibrary::WeatherSampleToSoilWeatherInput(
         SeasonSample, NowTime, TickDays);
 
 FVegetationTickAmbient VegAmbient =
-    UWeatherBlueprintLibrary::WeatherSampleToVegetationTickAmbient(
+    UPhenologyWeatherLibrary::WeatherSampleToVegetationTickAmbient(
         SeasonSample, NowTime);
 
-// Fill soil-derived channels from live soil state
+// Fill soil-derived channels from live soil state.
+// PAR is already filled from SolarInsolation by WeatherSampleToVegetationTickAmbient.
 const FSoilSample Soil = Field->GetSoil()->GetSample();
 VegAmbient.SoilTemperature = Soil.Temperature_C;
 VegAmbient.SoilMoisture    = Soil.VolumetricWaterContent;
-VegAmbient.PAR             = ComputePAR(SeasonSample, NowTime);
 
 Field->TickField(TickDays, SoilInput, VegAmbient);
 ```
 
-> **SoilTemperature, SoilMoisture, and PAR in FVegetationTickAmbient are always
-> zero after WeatherSampleToVegetationTickAmbient.** Fill them from live soil
-> state before every TickField call — the same partial-fill requirement as the
-> curve path.
+> **SoilTemperature and SoilMoisture in `FVegetationTickAmbient` are always
+> zero after `WeatherSampleToVegetationTickAmbient`.** Fill them from live soil
+> state before every `TickField` call. PAR is computed from `SolarInsolation`
+> automatically and does not need manual filling.
 
 `FSoilWeatherInput.RainfallMM` is automatically scaled by `TickDays` inside
 `WeatherSampleToSoilWeatherInput`, so you do not need to scale it manually.

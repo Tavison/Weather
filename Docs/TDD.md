@@ -38,8 +38,8 @@ for humidity (dry or humid air masses persist for several days).
 
 Relative humidity is emitted as a fraction in `[0, 1]` and clamped to that
 range after each AR(1) draw — draws that stray outside due to large σ are
-clipped rather than wrapped. The downstream consumer (Botany boundary) converts
-it to vapour pressure deficit: `VPD_kPa = SVP(T) × (1 − RH)`.
+clipped rather than wrapped. The downstream consumer converts it to vapour
+pressure deficit: `VPD_kPa = SVP(T) × (1 − RH)`.
 
 AR(1) was chosen over i.i.d. because independent days produce unrealistically
 rapid swings — a −15°C day followed by a +10°C day the next. The model's
