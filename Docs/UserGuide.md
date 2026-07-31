@@ -1,5 +1,14 @@
 # Weather Plugin — User Guide
 
+> **⚠ Rebuild in progress (2026-07-31).** Everything below describes the
+> plugin's previous generation model (per-day AR(1)/Bernoulli draws). That
+> model has been removed from the code, not just deprecated — `UWeatherTemplate`
+> no longer has the AR(1)/Rainfall-probability fields this page references, and
+> `UWeatherInstance::AdvanceTo` is currently a stub that returns no data.
+> The plugin is being rebuilt against a new design (continuous per-channel
+> curves, no per-day discretization) that is not finished yet. This page will
+> be rewritten once that lands — until then, treat it as historical, not current.
+
 ## Overview
 
 The Weather plugin generates physically-motivated daily weather data from
