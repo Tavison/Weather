@@ -1,170 +1,212 @@
 \mainpage Weather Plugin
 
-Stochastic daily weather generation for Unreal Engine 5.
-
-> **⚠ Rebuild in progress (2026-07-31).** Everything below describes the
-> plugin's previous generation model (per-day AR(1)/Bernoulli draws). That
-> model has been removed from the code, not just deprecated — `UWeatherTemplate`
-> no longer has the AR(1)/Rainfall-probability fields this page references, and
-> `UWeatherInstance::AdvanceTo` is currently a stub that returns no data.
-> The plugin is being rebuilt against a new design (continuous per-channel
-> curves, no per-day discretization) that is not finished yet. This page will
-> be rewritten once that lands — until then, treat it as historical, not current.
+Generates believable weather, one day at a time, from a climate you author.
 
 ## Overview
 
-The Weather plugin turns a designer-authored climate description into a
-stream of daily weather values: temperature, rainfall, wind, day length, and
-solar insolation. A `UWeatherTemplate` encodes the statistics of a locale
-— the seasonal shape and year-to-year variability. A `UWeatherInstance`
-holds a seed and a cursor, and each call to `AdvanceTo` draws the next span
-of weather from those statistics. The output is an `FWeatherSample` —
-one curve per channel over the requested span — which `UWeatherBlueprintLibrary`
-translates into the structs that Soil and Vegetation consume.
+Reach for this plugin when something in your game needs weather that behaves
+like weather: cold snaps and warm spells that last a few days, drizzle that
+comes and goes, fronts that roll through and take the wind with them, and
+seasons whose length depends on where you are on the planet. You describe a
+place once, as a `UWeatherTemplate` data asset. A `UWeatherInstance` binds that
+template, and every call to `AdvanceDay` hands you a new day of hourly curves:
+temperature, humidity, wind, rain, snow, blizzard flag, sun elevation, and solar
+irradiance, plus the day's length in hours.
 
-The plugin has no dependencies on Soil, Vegetation, or Botany; it is equally
-useful outside the agriculture stack for any system that wants
-physically-motivated daily climate data.
+The plugin has no cursor and no clock. It always holds exactly one day, the
+"current" day, and a new day exists only when you ask for it. Pace and time
+compression are your decisions, not the plugin's.
+
+Among the project's plugins, Weather depends only on `EcologyCommon` (for the
+`FWeatherDay` result type and the `IWeatherDaySource` interface) and
+`STD_Utilities`. It knows nothing about Soil, Vegetation, or Botany, so it is
+equally useful for driving visual effects or ambience.
 
 ## The primary path
 
 ```cpp
 // 1. Author a UWeatherTemplate data asset in the editor (one per locale).
-//    Bind it at runtime:
+//    Create an instance and bind it. Only the template is mandatory; every
+//    field of FWeatherInitParams has a default, so override what you need.
 UWeatherInstance* Weather = NewObject<UWeatherInstance>(Outer);
-Weather->Initialize(WeatherTemplate, Seed, 51.5f);  // latitude in degrees north
+Weather->Initialize(WeatherTemplate, { .Seed = 543243524, .Latitude = 51.5f, .StartingDay = 93 });
 
-// 2. Advance the cursor to produce weather curves for a span
-FWeatherSample Sample = Weather->AdvanceTo(NowTime);
-// Sample covers [previous LastProcessedTime, NowTime).
-// After this call, Weather->GetLastProcessedTime() == NowTime.
+// 2. Today's weather exists the moment Initialize returns. No AdvanceDay needed.
+const FWeatherDay& Today = Weather->GetTodaysWeather();
 
-// 3. Translate for Soil (curve path)
-FSoilWeather SoilWeather = UWeatherBlueprintLibrary::WeatherSampleToSoilWeather(Sample);
+// 3. Sample any hourly channel at any time of day, not just on whole hours.
+const float NoonTempC   = Today.Temperature_C.GetRichCurveConst()->Eval(12.0f);
+const float NoonWind_ms = Today.WindSpeed_ms.GetRichCurveConst()->Eval(12.0f);
+const float DaylightHrs = Today.DayLength_hours;             // a scalar, not a curve
 
-// 4. Translate for Vegetation (curve path) — then fill the three soil-derived channels
-FVegetationAmbient Ambient = UWeatherBlueprintLibrary::WeatherSampleToVegetationAmbient(Sample);
-// SoilTemperature, SoilMoisture, and PAR are left empty by this call —
-// fill them from your soil instance before passing to BotanyField::AdvanceTo.
+// 4. Move to the next day. Same value GetTodaysWeather() now returns.
+const FWeatherDay Tomorrow = Weather->AdvanceDay();
+// Weather->GetCurrentDay() is now 94.
 ```
 
-Sequential `AdvanceTo` calls carry AR(1) state forward — temperature, wind, and relative humidity
-are bit-exactly continuous at every span boundary. Advance week by week, day
-by day, or in any span size; the output is always identical to what a single
-call covering the full range would have produced.
+Every hourly channel is a `FRuntimeFloatCurve` keyed on hour-of-day `[0, 24)`, so
+you sample it with `GetRichCurveConst()->Eval(Hour)` at whatever rate your system
+runs. Keys sit on whole hours 0 through 23 and the curve holds its last value
+until hour 24, so a sample at 23.5 returns the hour-23 value.
 
-## Tick path variant
+**`StartingDay` is 1-based: day 1 is 1 January.** Days past `YearLength` wrap, so
+day 366 reads the same climate curves as day 1.
 
-When advancing simulation per game tick rather than per span, sample the
-pre-computed `FWeatherSample` at a point in time:
+### Handing weather to consumers
+
+Depend on `IWeatherDaySource` (EcologyCommon), not on `UWeatherInstance`. It
+exposes exactly the three calls above (`GetCurrentDay`, `GetTodaysWeather`,
+`AdvanceDay`), and `UWeatherInstance` implements it. Phenology takes one as an
+injected dependency and drives it for you:
 
 ```cpp
-// Pre-compute a season once (or advance week by week)
-FWeatherSample SeasonSample = Weather->AdvanceTo(SeasonEnd);
-
-// Each game tick
-FSoilWeatherInput SoilInput =
-    UWeatherBlueprintLibrary::WeatherSampleToSoilWeatherInput(SeasonSample, NowTime, TickDays);
-
-FVegetationTickAmbient TickAmbient =
-    UWeatherBlueprintLibrary::WeatherSampleToVegetationTickAmbient(SeasonSample, NowTime);
-// SoilTemperature, SoilMoisture, PAR left at zero — fill from soil state.
+UPhenologyField* Scene = NewObject<UPhenologyField>(Outer);
+Scene->Initialize(Weather);   // converts to TScriptInterface<IWeatherDaySource>
 ```
 
-Weather curves are authored at daily resolution. All ticks within the same
-calendar day evaluate to the same values; there is no intra-day variation
-unless you supply higher-resolution curve data.
+Translating a `FWeatherDay` into Soil and Vegetation input structs is done by
+`UPhenologyWeatherLibrary` in the Phenology plugin. Weather itself never sees
+those types.
 
-## Authoring a climate template
+For gameplay code, the `WeatherGameplay` plugin wraps a `UWeatherInstance` in a
+world subsystem so you don't construct one by hand.
 
-A `UWeatherTemplate` has twelve fields, all `FRuntimeFloatCurve` keyed on
-day-of-year `[0, 365]`.
+## Seeds and reproducing a run
 
-**Temperature** — `MeanTemperature_C`, `TemperatureStdDev_C`, `TemperatureAR1Alpha`
+Leave `Seed` at 0 and each `Initialize` draws its own random seed, so a new
+session gets new weather. To repeat a run exactly, pass the same nonzero seed
+with the same template and the same `FWeatherInitParams`. To capture the seed of
+a run you didn't choose, call `GetSeed()` right after `Initialize`. It returns
+the seed actually in use, never 0, and that is the value to save.
 
-The mean curve shapes the seasonal cycle. The σ curve controls how variable
-individual days are around that mean — winter days typically have wider σ than
-summer. `TemperatureAR1Alpha` (default 0.6) governs cold-snap persistence:
-higher values give each day more memory of the previous day.
+Determinism holds for a given build. The tests compare two instances built
+from the same inputs in one process; nothing checks output across platforms or
+compiler versions.
 
-**Rainfall** — `RainfallProbability`, `RainfallMean_mm`, `RainfallStdDev_mm`
+## Configuring a locale
 
-Rainfall is per-day independent (not AR(1)). `RainfallProbability` is a
-Bernoulli draw determining whether a day is wet; `RainfallMean_mm` and
-`RainfallStdDev_mm` determine how much falls on wet days. Annual total ≈
-`∫ probability(d) × mean_mm(d) dd`. Multi-day storm systems are a deferred
-extension.
+A `UWeatherTemplate` holds only what varies by place. Everything astronomical
+comes from `FWeatherInitParams` instead, because it belongs to the planet and
+the site, not the climate.
 
-**Wind** — `MeanWindSpeed_ms`, `WindStdDev_ms`, `WindAR1Alpha`
+**Temperature, humidity, wind.** Each has a mean curve, which sets the seasonal
+shape, and a standard-deviation curve, which scales the random wander around that
+mean. A wide winter value and a narrow summer one give you the changeable winters
+and settled summers of a temperate climate. Temperature is the exception for now:
+its wander uses a fixed 1.5 °C scale, and `TemperatureStdDev_C` is authored but not
+yet read.
 
-Same model as temperature. `WindAR1Alpha` (default 0.4) is lower because
-wind turns faster than temperature in most climates.
+**Rain and snow are two independent mechanisms.** *Microclimate* is a
+persistent local pattern, like an evening drizzle, and you author it as one or
+more example days (`FWeatherTypicalDay`), each drawn as rainfall by hour. A
+*Front* is a passing system, and you author it as one or more example passages
+(`FWeatherTypicalFront`), each drawn as rainfall against fraction of the
+passage. Both can be active in the same hour and neither suppresses the other;
+the hour's rainfall is their sum. Snow is not a third mechanism. It is a
+temperature gate: if the hour's temperature is below `SnowTemperatureThresholdC`,
+the whole total lands in `Snowfall_mm` instead of `Rainfall_mm`.
 
-**Relative humidity** — `MeanRelativeHumidity`, `RelativeHumidityStdDev`, `RelativeHumidityAR1Alpha`
-
-Same AR(1) model as temperature. Values are fractions in `[0, 1]` (0.75 = 75% RH);
-draws are clamped to that range after each step. Used downstream to compute
-vapour pressure deficit: `VPD = SVP(T) × (1 − RH)`. Typical temperate means
-are 0.65–0.85, higher in winter, lower in summer. `RelativeHumidityAR1Alpha`
-defaults to 0.6 — humid or dry air masses persist for several days.
-
-**Day length and solar insolation are not on the template.** Both are
-closed-form from latitude and day-of-year — the runtime computes them from
-the latitude you pass to `Initialize`.
-
-## Multiple locales and deterministic replay
-
-```cpp
-// Two independent locales from the same seed
-WeatherA->Initialize(NorthernTemplate, Seed, 57.5f);
-WeatherB->Initialize(SouthernTemplate, Seed, 51.5f);
-```
-
-Replay the same weather by saving `(TemplatePath, Seed, LatitudeDeg,
-LastProcessedTime)` before an advance. Same four values → identical output.
+**Day length and solar irradiance are not authored.** Both come from geometry:
+`Latitude`, the day of year, `AxialTiltDeg`, and `HorizonObstructionDeg` (see the
+reference below). The same template therefore gives correct seasons at any
+latitude.
 
 ## Gotchas
 
-**`SetLastProcessedTime` breaks AR(1) continuity.** Repositioning the cursor
-clears the carry. The next `AdvanceTo` uses a 30-day burn-in, producing a
-statistical seam. For seamless continuity, advance sequentially without
-repositioning.
+**`StartingDay` is not a seek.** `Initialize` always starts a fresh random
+stream, so initializing at day 200 gives you a plausible day 200, not the day 200
+you would have reached by advancing from day 1 with the same seed. If you need
+to resume a run, either advance from the original start or persist the state
+you care about yourself.
 
-**`WeatherSampleToVegetationAmbient` fills four channels and leaves three empty.**
-It fills `AirTemperature`, `DayLength`, `Wind`, and `VPD_kPa`; `SoilTemperature`,
-`SoilMoisture`, and `PAR` are left empty. Empty curves evaluate to effectively
-zero in Vegetation, driving maximum stress. Always fill those three from soil
-state before passing the ambient to Botany.
+**Only `AdvanceDay` checks for a missing `Initialize`.** Calling it first raises
+`Weather::NotInitializedException`. `GetCurrentDay` and `GetTodaysWeather` do not
+check: before `Initialize` they return day 1 and an empty `FWeatherDay`. A null
+template raises `Weather::NullTemplateException`. With exceptions enabled these
+throw; in a default Unreal build (exceptions off) they log and then hit a Fatal
+log, so treat both as programming errors.
 
-`VPD_kPa` is computed per key as `SVP(T) × (1 − RH)` where
-`SVP(T) = 0.6108 × exp(17.27 × T / (T + 237.3))` kPa. The tick path
-(`WeatherSampleToVegetationTickAmbient`) uses the same formula evaluated at
-a single point in time.
+**`YearLength` is not validated.** Pass a value of 1 or more. The plugin does no
+range check on `YearLength` or `StartingDay`; the other `Initialize` fields are
+clamped (see the reference).
 
-**`RainfallMM` in the tick path is a total, not a rate.** `WeatherSampleToSoilWeatherInput`
-multiplies the daily rate by `TickDays` before writing `FSoilWeatherInput.RainfallMM`.
-Temperature, wind, and insolation are point-in-time values.
+**Precipitation curves are rates in water-equivalent mm per hour, not daily
+totals.** Integrate the curve over the day for a total. `Snowfall_mm` is water
+equivalent, not depth. Use `SnowDepthRate_cm`, which is also a rate (depth added
+during that hour), never an accumulating snowpack. Nothing here models snow on the
+ground or melt.
+
+**`IsBlizzard` is a curve.** It is `1.0` or `0.0` at each key. Treat any sampled
+value above 0.5 as true.
+
+**Sun elevation ignores your horizon; day length does not.** `HorizonObstructionDeg`
+shortens `DayLength_hours` only. `SolarElevationDeg` is always the true geometric
+angle.
+
+**The standard deviations you author are noise scales, not the spread you will
+see.** Humidity, wind, and microclimate wander around their means and drift back
+over several days, which makes the observed standard deviation about 1.6 times the
+authored value. Tune by looking at output, not by reading the number off the
+curve. [TDD](Docs/TDD.md) has the arithmetic.
+
+**Some inputs are authored but not yet used, and some channels are placeholders.**
+`TemperatureStdDev_C` and a front's `LightningProbability` have no effect.
+Temperature's daily swing uses a fixed trough at 06:00 and peak at 15:00 and does
+not yet respond to generated humidity. Wind has sustained speed and front boosts
+but no gusts. [TDD](Docs/TDD.md) lists them with the reasoning.
 
 ## Reference
 
-### FWeatherSample channels
+### `FWeatherInitParams`
 
-| Channel | Unit | Model |
+Passed to `Initialize` after the template. Every field is optional. In C++ use
+designated initializers in declaration order and skip any you don't need.
+
+| Field | Default | Meaning |
 |---|---|---|
-| `AirTemperature_C` | °C | AR(1) from mean + σ |
-| `Rainfall_mm_per_day` | mm/day | Bernoulli × Normal, i.i.d. per day |
-| `WindSpeed_ms` | m/s | AR(1) from mean + σ, clamped ≥ 0 |
-| `DayLength_hours` | hours | Closed-form from latitude + day-of-year |
-| `SolarInsolation` | MJ/m²/day | Closed-form, attenuated by cloud-cover proxy |
-| `RelativeHumidity` | fraction [0,1] | AR(1) from mean + σ, clamped to [0, 1] |
+| `Seed` | `0` | `0` randomizes. Any other value is fully deterministic. |
+| `Latitude` | `0` | Degrees north, negative for south. Clamped to `[-89.9, 89.9]`. |
+| `StartingDay` | `1` | First `CurrentDay`, 1-based. Not validated. |
+| `YearLength` | `365` | Days per year for climate-curve wraparound. Not validated. |
+| `HorizonObstructionDeg` | `0` | Terrain angle hiding the sun. Shortens `DayLength_hours` only. Clamped to `[0, 89.9]`. |
+| `AxialTiltDeg` | `23.45` | Planet's axial tilt. `0` gives no seasons; larger swings harder. Clamped to `[0, 90]`. |
 
-All keys placed at day midpoints (integer day + 0.5) on the game-time axis.
+The clamped values are what the accessors report (`GetLatitude`,
+`GetHorizonObstructionDeg`, `GetAxialTiltDeg`); `GetSeed` reports the seed in use.
 
-### Translation helpers
+### `FWeatherDay` channels
 
-| Function | Output | Unfilled fields |
-|---|---|---|
-| `WeatherSampleToSoilWeather(Sample)` | `FSoilWeather` | — |
-| `WeatherSampleToVegetationAmbient(Sample)` | `FVegetationAmbient` | SoilTemperature, SoilMoisture, PAR |
-| `WeatherSampleToSoilWeatherInput(Sample, T, TickDays)` | `FSoilWeatherInput` | — |
-| `WeatherSampleToVegetationTickAmbient(Sample, T)` | `FVegetationTickAmbient` | SoilTemperature, SoilMoisture, PAR |
+| Channel | Type | Unit | Notes |
+|---|---|---|---|
+| `Day` | `int32` | | The day this is, 1-based. |
+| `Temperature_C` | curve | °C | Seasonal mean plus a carried random deviation plus a diurnal wave. |
+| `RelativeHumidity` | curve | fraction `[0, 1]` | Mean plus a carried deviation, clamped. No diurnal wave. |
+| `WindSpeed_ms` | curve | m/s | Mean plus a carried deviation, plus a front's `WindBoost_ms` while one is active. Never negative. |
+| `Rainfall_mm` | curve | mm/hour, water equivalent | Microclimate plus front, when at or above the snow threshold. |
+| `Snowfall_mm` | curve | mm/hour, water equivalent | The same total, when below the threshold. Mutually exclusive with rainfall. |
+| `SnowDepthRate_cm` | curve | cm/hour | Depth added by that hour's snowfall. A rate, not a running total. |
+| `IsBlizzard` | curve | `1.0` / `0.0` | Snowing, front-driven, and at least 70% (currently) of that front's own peak intensity. |
+| `SolarElevationDeg` | curve | degrees | True geometric elevation. Negative at night. |
+| `SolarInsolation_Wm2` | curve | W/m² | Clear-sky irradiance reduced by that hour's rain, snow, and humidity. Zero at night. |
+| `DayLength_hours` | `float` | hours | Accounts for `HorizonObstructionDeg`. `0` in polar night, `24` in polar day, never NaN. |
+
+### `UWeatherTemplate` fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `MeanTemperature_C` | curve by day-of-year | empty | Seasonal temperature shape. |
+| `TemperatureStdDev_C` | curve by day-of-year | empty | **Not yet read.** Temperature's random wander uses a fixed 1.5 °C scale. |
+| `MeanRelativeHumidity`, `RelativeHumidityStdDev` | curves by day-of-year | empty | Seasonal humidity shape and spread. |
+| `MeanWindSpeed_ms`, `WindStdDev_ms` | curves by day-of-year | empty | Sustained wind shape and spread. |
+| `MicroclimateTypicalDays` | array of `FWeatherTypicalDay` | empty | Authored example days. Empty gives a dry climate. |
+| `MicroclimateIntensityStdDev_mmPerHour` | float | `0` | Noise on top of the blended typical day. Not seasonal. |
+| `FrontFrequency` | curve by day-of-year | empty | Daily likelihood that a front begins. |
+| `FrontMeanDurationHours`, `FrontDurationStdDevHours` | float | `6`, `3` | How long a front lasts. Independent of which shape is drawn. |
+| `TypicalFronts` | array of `FWeatherTypicalFront` | empty | Authored example passages. |
+| `SnowTemperatureThresholdC` | float | `0` | Below this, precipitation is snow. |
+
+`FWeatherTypicalDay` holds `IntensityByHourOfDay` and `SeasonalLikelihood`.
+`FWeatherTypicalFront` holds `IntensityByPassageFraction`, `SeasonalLikelihood`,
+`WindBoost_ms`, and `LightningProbability` (not yet read). Likelihood curves are
+weights, not probabilities: they need not sum to 1 and are normalized at generation
+time. All day-of-year curves are keyed on zero-based day-of-year `[0, 365]`.

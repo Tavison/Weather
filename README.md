@@ -1,35 +1,39 @@
-# Weather — Stochastic Weather Generation for Unreal Engine 5
+# Weather: Stochastic Weather Generation for Unreal Engine 5
 
-The Weather plugin turns a designer-authored climate description into a stream
-of daily weather values: temperature, rainfall, wind, day length, solar
-insolation, and relative humidity. It has no dependencies on any other plugin
-and is equally useful outside the agriculture stack for any system that wants
-physically-motivated daily climate data.
+Weather generates believable daily weather from a climate you author. Describe
+a place once as a `UWeatherTemplate` data asset, bind it to a `UWeatherInstance`,
+and each `AdvanceDay` call returns the next day's hourly curves: temperature,
+humidity, wind, rain, snow, blizzard flag, sun elevation and irradiance, plus the
+day's length in hours.
 
-## How it works
+The plugin holds one day at a time and has no clock. Rain comes from two
+independent mechanisms, a persistent local microclimate and passing fronts, and
+snow is a temperature gate on whatever is falling. Day length and irradiance are
+computed from latitude, axial tilt, and horizon obstruction, so one template
+works at any latitude and on any planet.
 
-A `UWeatherTemplate` data asset encodes the statistical envelope of a locale —
-the seasonal shape and year-to-year variability of each channel. A
-`UWeatherInstance` holds a seed and a cursor; each call to `AdvanceTo` draws
-the next span of weather from those statistics and returns an `FWeatherSample`
-carrying one curve per channel.
-
-`UWeatherBlueprintLibrary` translates `FWeatherSample` into the input structs
-that Soil and Vegetation consume. The core plugin — template, instance, sample
-— knows nothing about those consumers.
+Among the project's plugins it depends only on `EcologyCommon` and
+`STD_Utilities`. It knows nothing about Soil, Vegetation, or Botany, and is equally
+useful for driving visual effects or ambience.
 
 ## Docs layout
 
 ```
-mainpage.md       Doxygen entry point — primary path, template authoring, gotchas
-Docs/TDD.md       Technical design — stochastic models, determinism, test surface
-Docs/UserGuide.md Designer-facing guide — authoring templates, tuning climate feel
+mainpage.md   Doxygen entry point: the call sequence, gotchas, and field reference
+Docs/TDD.md   Technical design: how a day is generated, why, and known limitations
 ```
+
+The designer-facing guide to authoring a climate template is maintained in
+Confluence, outside this repository.
 
 ## Companion repositories
 
 | Repo | Contents |
 |---|---|
-| Weather_Code (private) | C++ source |
-| Flora (public) | Docs for the Flora plant-simulation plugins |
-| Flora_Code (private) | C++ source for Flora |
+| Weather (public) | These docs |
+| Weather_Code (private) | C++ source for this plugin |
+| EcologyCommon (private) | `FWeatherDay` and `IWeatherDaySource`, the contract Weather implements |
+| WeatherGameplay (private) | World subsystem that owns a `UWeatherInstance` for gameplay code |
+| WeatherGameplay_Docs (public) | Docs for WeatherGameplay |
+| Flora (private) | Plant-simulation plugins, including Phenology, which consumes Weather |
+| Flora_Docs (public) | Docs for the Flora plugins |
